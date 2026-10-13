@@ -28,7 +28,7 @@ inputs:
     required: false
     default: 'apply'
   allow-delete:
-    description: 'Allow deletion of monitors not in the config, and replacement (delete + create) of monitors whose type changed. Default false (both are shown but not applied).'
+    description: 'Allow deletion of monitors not in the config, and replacement (delete + create) of monitors whose type changes to or from heartbeat. Default false (both are shown but not applied).'
     required: false
     default: 'false'
   node-version:
@@ -48,7 +48,7 @@ outputs:
     description: 'Number of monitors updated (0 in plan/diff mode).'
     value: ${{ steps.apply.outputs.updated }}
   replaced:
-    description: 'Number of monitors replaced because their type changed (0 unless allow-delete + apply mode).'
+    description: 'Number of monitors replaced because their type changed to or from heartbeat (0 unless allow-delete + apply mode).'
     value: ${{ steps.apply.outputs.replaced }}
   deleted:
     description: 'Number of monitors deleted (0 unless allow-delete + apply mode).'

@@ -39,7 +39,7 @@ jobs:
 | `api-token` | yes | — | API token with Monitor Manager permissions |
 | `config-file` | no | `monitors.uw.json` | Path to the config file (JSON: `{ "monitors": [...] }`) |
 | `mode` | no | `apply` | `apply` applies every change. `diff` shows the plan and exits 2 when there is drift. `plan` shows the plan and always exits 0 |
-| `allow-delete` | no | `false` | Delete monitors that are not in the config, and replace monitors whose `type` changed (the API cannot change a type in place, so the old monitor and its history are deleted and a new one is created). When false, both are shown but not applied; a blocked type change makes `apply` fail |
+| `allow-delete` | no | `false` | Delete monitors that are not in the config, and replace monitors whose `type` changes to or from `heartbeat` (the API cannot do that in place, so the old monitor and its history are deleted and a new one is created; other type changes are updates). When false, both are shown but not applied; a blocked replacement makes `apply` fail |
 | `node-version` | no | `22` | Node.js version for the CLI (20 or later) |
 | `base-url` | no | `https://app.uptimewarden.online` | API base URL, passed to the CLI as `UW_API_URL` |
 
@@ -49,11 +49,36 @@ jobs:
 |---|---|
 | `created` | Monitors created (0 in `plan` and `diff`) |
 | `updated` | Monitors updated (0 in `plan` and `diff`) |
-| `replaced` | Monitors replaced because their `type` changed (0 unless `allow-delete` is true in `apply` mode) |
+| `replaced` | Monitors replaced because their `type` changed to or from `heartbeat` (0 unless `allow-delete` is true in `apply` mode) |
 | `deleted` | Monitors deleted (0 unless `allow-delete` is true in `apply` mode) |
 | `has-drift` | `true` when the config differed from what was live before the run. `unknown` when the plan failed |
 
 The step also writes a summary table (or the plan) to the job summary.
+
+## Config file
+
+The config is the CLI's: a `monitors` array where each entry has an
+`externalId`, a `name` and any `/api/v1/monitors` field under the API's name
+(check settings, regions, thresholds, alert routing, maintenance windows,
+heartbeat settings). Escalation policies and webhooks can be given by name.
+See the [CLI README](https://github.com/UptimeWarden/cli#config-file) for the
+field list and the diff rules.
+
+```json
+{
+  "monitors": [
+    {
+      "externalId": "api-prod",
+      "name": "API (production)",
+      "type": "http",
+      "url": "https://api.example.com/health",
+      "interval": 60,
+      "expectedStatusCodes": "200-299",
+      "escalationPolicyId": "P1 on-call"
+    }
+  ]
+}
+```
 
 ## How it works
 
