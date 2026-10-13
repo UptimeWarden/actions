@@ -55,7 +55,7 @@ jobs:
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `url` | yes | | Target URL (http or https, public addresses only) |
-| `regions` | no | `""` (runs from `gwc`) | Comma-separated regions: `ae`, `brs`, `gwc`, `sea`, `uaen`, `wus3` |
+| `regions` | no | `""` (runs from `gwc`) | Comma-separated regions: `ae` (Sydney), `brs` (São Paulo), `gwc` (Sweden Central), `sea` (East Asia), `wus3` (Phoenix) |
 | `expect-status` | no | `""` | Expected HTTP status. Empty means any 2xx is up |
 | `timeout` | no | `30s` | Per-region probe timeout (`10s`, `5000ms`). Server ceiling is 50s |
 | `fail-on-down` | no | `true` | Fail the step when any region reports down |
@@ -98,11 +98,12 @@ Outputs: `blocked`, `incident-count`, `incidents-json`.
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `token` | yes | | Heartbeat token from the monitor's page in the dashboard |
-| `state` | no | `success` | `success` or `failure` |
+| `state` | no | `success` | `success`. `failure` is not supported yet: the endpoint records every ping as a success, so the step fails without sending one |
 | `message` | no | `""` | Note attached to the ping, shown on the incident timeline |
 | `base-url` | no | `https://app.uptimewarden.online` | API base URL |
 
-Outputs: `status` (HTTP status code of the ping).
+Outputs: `status` (HTTP status code of the ping). To report a failed job,
+skip the ping; the monitor alerts when the heartbeat is overdue.
 
 ## notify-deploy-start and notify-deploy-finish
 
@@ -206,11 +207,12 @@ Outputs: `matched-incidents`, `linked-count`.
 | `api-token` | yes | | API token with Monitor Manager permissions |
 | `config-file` | no | `monitors.uw.json` | Path to the config file (`{ "monitors": [...] }`) |
 | `mode` | no | `apply` | `apply`, `diff` (exit 2 on drift) or `plan` (always exit 0) |
-| `allow-delete` | no | `false` | Delete monitors that are not in the config |
+| `allow-delete` | no | `false` | Delete monitors that are not in the config, and replace (delete + create) monitors whose `type` changed |
 | `node-version` | no | `22` | Node.js version for the CLI (20 or later) |
-| `base-url` | no | `https://app.uptimewarden.online` | API base URL |
+| `base-url` | no | `https://app.uptimewarden.online` | API base URL (passed to the CLI as `UW_API_URL`) |
 
-Outputs: `created`, `updated`, `deleted`, `has-drift`.
+Outputs: `created`, `updated`, `replaced`, `deleted`, `has-drift`. `has-drift`
+comes from the exit code of `uw apply --diff-only` (0 = in sync, 2 = drift).
 
 ---
 

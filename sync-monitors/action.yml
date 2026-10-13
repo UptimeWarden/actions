@@ -28,7 +28,7 @@ inputs:
     required: false
     default: 'apply'
   allow-delete:
-    description: 'Allow deletion of monitors not in the config. Default false (deletes are shown but not applied).'
+    description: 'Allow deletion of monitors not in the config, and replacement (delete + create) of monitors whose type changed. Default false (both are shown but not applied).'
     required: false
     default: 'false'
   node-version:
@@ -36,7 +36,7 @@ inputs:
     required: false
     default: '22'
   base-url:
-    description: 'API base URL. Default: https://app.uptimewarden.online'
+    description: 'API base URL (passed to the CLI as UW_API_URL). Default: https://app.uptimewarden.online'
     required: false
     default: 'https://app.uptimewarden.online'
 
@@ -47,11 +47,14 @@ outputs:
   updated:
     description: 'Number of monitors updated (0 in plan/diff mode).'
     value: ${{ steps.apply.outputs.updated }}
+  replaced:
+    description: 'Number of monitors replaced because their type changed (0 unless allow-delete + apply mode).'
+    value: ${{ steps.apply.outputs.replaced }}
   deleted:
-    description: 'Number of monitors deleted (0 unless --allow-delete + apply mode).'
+    description: 'Number of monitors deleted (0 unless allow-delete + apply mode).'
     value: ${{ steps.apply.outputs.deleted }}
   has-drift:
-    description: 'true if the config differs from live state.'
+    description: 'true if the config differed from live state before this run (from the CLI exit code of `uw apply --diff-only`).'
     value: ${{ steps.apply.outputs.has-drift }}
 
 runs:
@@ -71,7 +74,7 @@ runs:
       shell: bash
       env:
         UW_API_TOKEN: ${{ inputs.api-token }}
-        UW_BASE_URL: ${{ inputs.base-url }}
+        UW_API_URL: ${{ inputs.base-url }}
         UW_MODE: ${{ inputs.mode }}
         UW_ALLOW_DELETE: ${{ inputs.allow-delete }}
         UW_CONFIG_FILE: ${{ inputs.config-file }}
@@ -96,42 +99,60 @@ runs:
           exit 1
         fi
 
-        uw auth login --token "${UW_API_TOKEN}" --base-url "${UW_BASE_URL}"
-
-        APPLY_ARGS="-f ${UW_CONFIG_FILE} --base-url ${UW_BASE_URL}"
-
-        if [ "${UW_MODE}" = "apply" ]; then
-          APPLY_ARGS="${APPLY_ARGS} --yes"
-        fi
-        if [ "${UW_MODE}" = "diff" ]; then
-          APPLY_ARGS="${APPLY_ARGS} --diff-only"
-        fi
+        # The CLI reads UW_API_TOKEN and UW_API_URL from the environment, so
+        # nothing is written to disk.
+        common_args=(-f "${UW_CONFIG_FILE}" --base-url "${UW_API_URL}")
         if [ "${UW_ALLOW_DELETE}" = "true" ]; then
-          APPLY_ARGS="${APPLY_ARGS} --allow-delete"
+          common_args+=(--allow-delete)
         fi
 
-        # Run apply and capture output for step summary + outputs.
+        # 1. Plan. Drift comes from the CLI's exit code, not from parsing its
+        #    text: `uw apply --diff-only` exits 0 without drift, 2 with drift
+        #    and 1 on error.
         set +e
-        output=$(uw apply ${APPLY_ARGS} 2>&1)
-        exit_code=$?
+        plan_output=$(uw apply "${common_args[@]}" --diff-only 2>&1)
+        plan_code=$?
         set -e
+        echo "${plan_output}"
 
-        echo "${output}"
+        case "${plan_code}" in
+          0) has_drift="false" ;;
+          2) has_drift="true" ;;
+          *)
+            echo "::error::uw apply (plan) failed with exit code ${plan_code}"
+            echo "has-drift=unknown" >> "${GITHUB_OUTPUT}"
+            exit "${plan_code}"
+            ;;
+        esac
 
-        # Parse counters from output (simple grep; CLI writes human-readable lines).
-        created=$(printf '%s' "${output}" | grep -c '✓ created' || true)
-        updated=$(printf '%s' "${output}" | grep -c '✓ updated' || true)
-        deleted=$(printf '%s' "${output}" | grep -c '✓ deleted' || true)
+        # 2. Apply (apply mode only, and only when there is something to do).
+        output="${plan_output}"
+        exit_code=0
+        if [ "${UW_MODE}" = "apply" ] && [ "${has_drift}" = "true" ]; then
+          set +e
+          output=$(uw apply "${common_args[@]}" --yes 2>&1)
+          exit_code=$?
+          set -e
+          echo "${output}"
+        fi
 
-        # Detect drift: any + / ~ / - lines in the plan means drift.
-        has_drift="false"
-        if printf '%s' "${output}" | grep -qE '^\s+[+~-] '; then
-          has_drift="true"
+        created=0
+        updated=0
+        replaced=0
+        deleted=0
+        if [ "${UW_MODE}" = "apply" ]; then
+          # The CLI prints one "✓ created/updated/replaced/deleted" line per
+          # monitor it changed.
+          created=$(printf '%s\n' "${output}" | grep -c '✓ created' || true)
+          updated=$(printf '%s\n' "${output}" | grep -c '✓ updated' || true)
+          replaced=$(printf '%s\n' "${output}" | grep -c '✓ replaced' || true)
+          deleted=$(printf '%s\n' "${output}" | grep -c '✓ deleted' || true)
         fi
 
         {
           echo "created=${created}"
           echo "updated=${updated}"
+          echo "replaced=${replaced}"
           echo "deleted=${deleted}"
           echo "has-drift=${has_drift}"
         } >> "${GITHUB_OUTPUT}"
@@ -140,37 +161,41 @@ runs:
         {
           case "${UW_MODE}" in
             apply)
-              if [ "$((created + updated + deleted))" -gt 0 ]; then
-                echo "## UptimeWarden Monitor Sync ✅"
-                echo ""
-                echo "| Created | Updated | Deleted |"
-                echo "|---------|---------|---------|"
-                echo "| ${created} | ${updated} | ${deleted} |"
-              else
-                echo "## UptimeWarden Monitor Sync ✅"
-                echo ""
+              echo "## UptimeWarden Monitor Sync"
+              echo ""
+              if [ "${has_drift}" = "false" ]; then
                 echo "No changes — monitors are in sync."
-              fi
-              ;;
-            diff)
-              if [ "${has_drift}" = "true" ]; then
-                echo "## UptimeWarden Monitor Sync 🔴 Drift detected"
-                echo ""
-                echo "\`\`\`"
-                printf '%s\n' "${output}"
-                echo "\`\`\`"
               else
-                echo "## UptimeWarden Monitor Sync ✅ No drift"
+                echo "| Created | Updated | Replaced | Deleted |"
+                echo "|---------|---------|----------|---------|"
+                echo "| ${created} | ${updated} | ${replaced} | ${deleted} |"
+                if [ "${exit_code}" -ne 0 ]; then
+                  echo ""
+                  echo "Apply exited with code ${exit_code}:"
+                  echo ""
+                  echo "\`\`\`"
+                  printf '%s\n' "${output}"
+                  echo "\`\`\`"
+                fi
               fi
               ;;
-            plan)
-              echo "## UptimeWarden Monitor Sync — Plan"
+            diff|plan)
+              if [ "${has_drift}" = "true" ]; then
+                echo "## UptimeWarden Monitor Sync — drift detected"
+              else
+                echo "## UptimeWarden Monitor Sync — no drift"
+              fi
               echo ""
               echo "\`\`\`"
-              printf '%s\n' "${output}"
+              printf '%s\n' "${plan_output}"
               echo "\`\`\`"
               ;;
           esac
         } >> "${GITHUB_STEP_SUMMARY}"
 
-        exit "${exit_code}"
+        if [ "${exit_code}" -ne 0 ]; then
+          exit "${exit_code}"
+        fi
+        if [ "${UW_MODE}" = "diff" ] && [ "${has_drift}" = "true" ]; then
+          exit 2
+        fi

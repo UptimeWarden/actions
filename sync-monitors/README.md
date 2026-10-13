@@ -39,9 +39,9 @@ jobs:
 | `api-token` | yes | — | API token with Monitor Manager permissions |
 | `config-file` | no | `monitors.uw.json` | Path to the config file (JSON: `{ "monitors": [...] }`) |
 | `mode` | no | `apply` | `apply` applies every change. `diff` shows the plan and exits 2 when there is drift. `plan` shows the plan and always exits 0 |
-| `allow-delete` | no | `false` | Delete monitors that are not in the config. When false, deletions are shown but not applied |
+| `allow-delete` | no | `false` | Delete monitors that are not in the config, and replace monitors whose `type` changed (the API cannot change a type in place, so the old monitor and its history are deleted and a new one is created). When false, both are shown but not applied; a blocked type change makes `apply` fail |
 | `node-version` | no | `22` | Node.js version for the CLI (20 or later) |
-| `base-url` | no | `https://app.uptimewarden.online` | API base URL |
+| `base-url` | no | `https://app.uptimewarden.online` | API base URL, passed to the CLI as `UW_API_URL` |
 
 ## Outputs
 
@@ -49,14 +49,26 @@ jobs:
 |---|---|
 | `created` | Monitors created (0 in `plan` and `diff`) |
 | `updated` | Monitors updated (0 in `plan` and `diff`) |
+| `replaced` | Monitors replaced because their `type` changed (0 unless `allow-delete` is true in `apply` mode) |
 | `deleted` | Monitors deleted (0 unless `allow-delete` is true in `apply` mode) |
-| `has-drift` | `true` when the config differs from what is live |
+| `has-drift` | `true` when the config differed from what was live before the run. `unknown` when the plan failed |
 
 The step also writes a summary table (or the plan) to the job summary.
+
+## How it works
+
+1. `uw apply -f <config> --diff-only` prints the plan. Its exit code sets
+   `has-drift`: 0 means in sync, 2 means drift, anything else fails the step.
+2. In `apply` mode, and only when there is drift, `uw apply -f <config> --yes`
+   applies it.
+3. `diff` mode exits 2 when there is drift; `plan` mode always exits 0.
+
+The token and API URL reach the CLI as `UW_API_TOKEN` and `UW_API_URL`; no
+config file is written.
 
 ## Notes
 
 - The counters are read from the CLI's human-readable output, so they follow
-  its `✓ created` / `✓ updated` / `✓ deleted` lines.
+  its `✓ created` / `✓ updated` / `✓ replaced` / `✓ deleted` lines.
 - The action does nothing a local `uw apply` would not do. Test a config
   locally with `uw apply -f monitors.uw.json --diff-only` first.

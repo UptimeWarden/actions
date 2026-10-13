@@ -17,7 +17,7 @@ inputs:
     description: 'Heartbeat token (from /monitors/<id> in the UptimeWarden dashboard).'
     required: true
   state:
-    description: 'Reported state: "success" or "failure". Defaults to "success".'
+    description: 'Reported state. Only "success" is supported today: the heartbeat endpoint records every ping as a success, so "failure" fails the step without sending a ping.'
     required: false
     default: 'success'
   message:
@@ -51,6 +51,19 @@ runs:
           echo "::error::heartbeat token is required"
           exit 1
         fi
+        case "${UW_STATE}" in
+          success) : ;;
+          failure)
+            # The endpoint records every ping as a success. Sending one for a
+            # failed job would report it healthy, so send nothing and fail.
+            echo "::error::state=failure is not supported yet: the heartbeat endpoint records every ping as a success, so no ping was sent. To report a failed job, skip the ping; the monitor alerts when the heartbeat is overdue."
+            exit 1
+            ;;
+          *)
+            echo "::error::state must be 'success' (got '${UW_STATE}')"
+            exit 1
+            ;;
+        esac
         # Build payload as JSON. We avoid jq to keep the action portable
         # to runners without it; printf with %s handles the literal cases
         # we need (state + message are short, ASCII).
@@ -84,11 +97,7 @@ runs:
 
         # Job summary
         {
-          if [ "${UW_STATE}" = "success" ]; then
-            echo "## UptimeWarden Heartbeat ✅"
-          else
-            echo "## UptimeWarden Heartbeat ⚠️"
-          fi
+          echo "## UptimeWarden Heartbeat ✅"
           echo ""
           echo "| | |"
           echo "|---|---|"

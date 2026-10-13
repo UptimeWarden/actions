@@ -18,7 +18,7 @@ inputs:
     description: 'Target URL to probe (http or https, public IPs only).'
     required: true
   regions:
-    description: 'Comma-separated regions to probe from (ae, brs, gwc, sea, uaen, wus3). Default: gwc. Without an account (GitHub OIDC) one region per check; with a UW API token up to your plan''s verification region limit.'
+    description: 'Comma-separated regions to probe from (ae Sydney, brs São Paulo, gwc Sweden Central, sea East Asia, wus3 Phoenix). Default: gwc. Without an account (GitHub OIDC) one region per check; with a UW API token up to your plan''s verification region limit.'
     required: false
     default: ''
   expect-status:
