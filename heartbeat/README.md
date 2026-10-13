@@ -17,24 +17,22 @@ time, an incident opens automatically.
     message: "Deploy ${{ github.sha }} done"
 ```
 
-Failure path:
+### Reporting a failure
 
-```yaml
-- name: Notify UptimeWarden on failure
-  if: failure()
-  uses: uptimewarden/actions/heartbeat@v1
-  with:
-    token: ${{ secrets.UW_HEARTBEAT_TOKEN }}
-    state: failure
-    message: "Deploy ${{ github.sha }} failed at ${{ github.job }}"
-```
+The heartbeat endpoint records every ping as a success; it cannot record a
+failure yet. `state: failure` therefore fails the step **without sending a
+ping**, instead of reporting a failed job as healthy.
+
+To report a failure today, skip the ping: run the step only when the job
+succeeded (the default for a step without `if:`), and the monitor alerts when
+the heartbeat is overdue.
 
 ## Inputs
 
 | Name | Required | Default | Description |
 |---|---|---|---|
 | `token` | yes | — | Heartbeat token from the monitor's settings page |
-| `state` | no | `success` | `success` or `failure` |
+| `state` | no | `success` | `success`. `failure` is not supported yet and fails the step without sending a ping |
 | `message` | no | `""` | Human-readable note attached to the ping |
 | `base-url` | no | `https://app.uptimewarden.online` | API base URL |
 

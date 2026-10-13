@@ -47,7 +47,7 @@ verification region limit (see Limits):
 | Name | Required | Default | Description |
 |---|---|---|---|
 | `url` | yes | — | Target URL (http or https; public IPs only) |
-| `regions` | no | `""` | Csv of regions (`ae`, `brs`, `gwc`, `sea`, `uaen`, `wus3`). Default: `gwc` |
+| `regions` | no | `""` | Csv of regions (`ae` (Sydney), `brs` (São Paulo), `gwc` (Sweden Central), `sea` (East Asia), `wus3` (Phoenix)). Default: `gwc` |
 | `expect-status` | no | `""` | Expected status code. Default: any 2xx is up |
 | `timeout` | no | `30s` | Per-region probe timeout (`30s`, `5000ms`, `10s`) |
 | `fail-on-down` | no | `true` | Whether the step fails when any region reports down |
