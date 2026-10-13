@@ -12,7 +12,7 @@ which every GitHub-hosted runner has).
 |---|---|
 | [`check`](./check) | One-shot multi-region uptime check. No account needed (GitHub OIDC). |
 | [`check-incidents`](./check-incidents) | Pre-deploy gate: fails when an active incident is at or above a severity. |
-| [`heartbeat`](./heartbeat) | Sends a heartbeat ping from a CI step. |
+| [`heartbeat`](./heartbeat) | Sends a heartbeat ping, or reports a failure, from a CI step. |
 | [`notify-deploy-start`](./notify-deploy-start) | Records a deploy marker and opens maintenance windows. |
 | [`notify-deploy-finish`](./notify-deploy-finish) | Closes those windows and finalises the deploy marker. |
 | [`postmortem-link`](./postmortem-link) | Links a merged PR to the incidents it references. |
@@ -98,12 +98,12 @@ Outputs: `blocked`, `incident-count`, `incidents-json`.
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `token` | yes | | Heartbeat token from the monitor's page in the dashboard |
-| `state` | no | `success` | `success`. `failure` is not supported yet: the endpoint records every ping as a success, so the step fails without sending one |
-| `message` | no | `""` | Note attached to the ping, shown on the incident timeline |
+| `state` | no | `success` | `success` pings `/ping`; `failure` calls `/fail`, which opens an incident within about 30 seconds |
+| `message` | no | `""` | Note sent with the signal; on failure it becomes the incident error (first 500 characters) |
 | `base-url` | no | `https://app.uptimewarden.online` | API base URL |
 
-Outputs: `status` (HTTP status code of the ping). To report a failed job,
-skip the ping; the monitor alerts when the heartbeat is overdue.
+Outputs: `status` (HTTP status code of the heartbeat endpoint). Run a second
+step with `if: failure()` and `state: failure` to report a failed job.
 
 ## notify-deploy-start and notify-deploy-finish
 
@@ -207,7 +207,7 @@ Outputs: `matched-incidents`, `linked-count`.
 | `api-token` | yes | | API token with Monitor Manager permissions |
 | `config-file` | no | `monitors.uw.json` | Path to the config file (`{ "monitors": [...] }`) |
 | `mode` | no | `apply` | `apply`, `diff` (exit 2 on drift) or `plan` (always exit 0) |
-| `allow-delete` | no | `false` | Delete monitors that are not in the config, and replace (delete + create) monitors whose `type` changed |
+| `allow-delete` | no | `false` | Delete monitors that are not in the config, and replace (delete + create) monitors whose `type` changes to or from `heartbeat` |
 | `node-version` | no | `22` | Node.js version for the CLI (20 or later) |
 | `base-url` | no | `https://app.uptimewarden.online` | API base URL (passed to the CLI as `UW_API_URL`) |
 
