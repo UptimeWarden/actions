@@ -1,0 +1,27 @@
+# Manual smoke test. Runs the `check` action from this checkout against
+# uptimewarden.online with the workflow's GitHub OIDC token (no secrets).
+# actionlint also uses this file to validate the local action's inputs.
+name: Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./check
+        id: probe
+        with:
+          url: https://uptimewarden.online
+          timeout: 10s
+      - name: Show result
+        env:
+          UP: ${{ steps.probe.outputs.up }}
+          SLOWEST: ${{ steps.probe.outputs.slowest-region-ms }}
+        run: echo "up=${UP} slowest=${SLOWEST}ms"

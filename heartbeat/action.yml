@@ -1,0 +1,100 @@
+# UptimeWarden Heartbeat.
+#
+# A composite action that sends one `curl -X POST` to the UptimeWarden
+# heartbeat endpoint. No Node, no Python, no install step: it runs on any
+# runner that has bash and curl.
+
+name: 'UptimeWarden Heartbeat'
+description: 'Send a heartbeat ping to UptimeWarden from any CI step (cron, scheduled deploy, batch job).'
+author: 'UptimeWarden'
+
+branding:
+  icon: 'activity'
+  color: 'blue'
+
+inputs:
+  token:
+    description: 'Heartbeat token (from /monitors/<id> in the UptimeWarden dashboard).'
+    required: true
+  state:
+    description: 'Reported state: "success" or "failure". Defaults to "success".'
+    required: false
+    default: 'success'
+  message:
+    description: 'Optional human-readable message attached to the ping (visible in incident timeline).'
+    required: false
+    default: ''
+  base-url:
+    description: 'API base URL. Default: https://app.uptimewarden.online'
+    required: false
+    default: 'https://app.uptimewarden.online'
+
+outputs:
+  status:
+    description: 'HTTP status code returned by the heartbeat endpoint.'
+    value: ${{ steps.ping.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Send heartbeat ping
+      id: ping
+      shell: bash
+      env:
+        UW_TOKEN: ${{ inputs.token }}
+        UW_STATE: ${{ inputs.state }}
+        UW_MESSAGE: ${{ inputs.message }}
+        UW_BASE_URL: ${{ inputs.base-url }}
+      run: |
+        set -euo pipefail
+        if [ -z "${UW_TOKEN}" ]; then
+          echo "::error::heartbeat token is required"
+          exit 1
+        fi
+        # Build payload as JSON. We avoid jq to keep the action portable
+        # to runners without it; printf with %s handles the literal cases
+        # we need (state + message are short, ASCII).
+        payload=$(printf '{"state":"%s","message":"%s","source":"github-actions"}' \
+          "${UW_STATE}" "${UW_MESSAGE//\"/\\\"}")
+
+        url="${UW_BASE_URL%/}/api/heartbeat/${UW_TOKEN}/ping"
+        echo "POST ${url}"
+
+        # -w writes the status code to stdout after the body; -o discards
+        # the body (we don't need it). --fail makes curl exit 22 on >=400
+        # which fails the step automatically.
+        # Note: --fail-with-body requires curl 7.76+ (2021-03). We use
+        # --fail --show-error instead, which is available on all curl
+        # versions including RHEL 8 (7.61) and Ubuntu 20.04 (7.68).
+        # --show-error prints the error message even when --silent is set,
+        # preserving debuggability on non-2xx responses.
+        status=$(curl --fail --show-error \
+          --silent \
+          --max-time 30 \
+          -X POST \
+          -H "Content-Type: application/json" \
+          -H "X-UW-Source: github-actions" \
+          -H "User-Agent: uptimewarden-heartbeat-action/1.0" \
+          --data "${payload}" \
+          --output /dev/null \
+          --write-out "%{http_code}" \
+          "${url}")
+        echo "status=${status}" >> "${GITHUB_OUTPUT}"
+        echo "::notice::UptimeWarden heartbeat sent (HTTP ${status})"
+
+        # Job summary
+        {
+          if [ "${UW_STATE}" = "success" ]; then
+            echo "## UptimeWarden Heartbeat ✅"
+          else
+            echo "## UptimeWarden Heartbeat ⚠️"
+          fi
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| State | \`${UW_STATE}\` |"
+          echo "| HTTP status | \`${status}\` |"
+          if [ -n "${UW_MESSAGE}" ]; then
+            echo "| Message | ${UW_MESSAGE} |"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"

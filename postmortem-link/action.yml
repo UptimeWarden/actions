@@ -1,0 +1,162 @@
+# UptimeWarden Postmortem Link: link merged PRs to incidents.
+#
+# Run on `pull_request` (closed, merged) events. The action scans the PR
+# body for `Fixes #incident-<publicId>` / `Closes #incident-<publicId>` /
+# `Resolves #incident-<publicId>` references and adds an entry to each
+# matching incident's timeline that points back at the merged PR.
+#
+# Uses POST /api/v1/incidents/:id/comments (API-token surface).
+#
+# The action deliberately does NOT change the incident's status. Only an
+# authorised UptimeWarden user resolves an incident; a merged PR is a
+# signal, not a verdict.
+
+name: 'UptimeWarden Postmortem Link'
+description: 'On PR merge, link the PR to UptimeWarden incidents referenced in the PR body (Fixes #incident-<publicId>).'
+author: 'UptimeWarden'
+
+branding:
+  icon: 'link'
+  color: 'blue'
+
+inputs:
+  api-token:
+    description: 'UptimeWarden API token with `incidents:update` permission.'
+    required: true
+  status:
+    description: 'Status recorded on the timeline entry added to each matched incident. Defaults to `monitoring` — does NOT change the incident itself, only the timeline entry kind. Pass `investigating` for in-progress signals.'
+    required: false
+    default: 'monitoring'
+  base-url:
+    description: 'API base URL. Default: https://app.uptimewarden.online'
+    required: false
+    default: 'https://app.uptimewarden.online'
+
+outputs:
+  matched-incidents:
+    description: 'Comma-separated incident publicIds that the PR body referenced.'
+    value: ${{ steps.link.outputs.matched-incidents }}
+  linked-count:
+    description: 'How many incidents the action successfully posted updates to (≤ matched-incidents count if some failed).'
+    value: ${{ steps.link.outputs.linked-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Parse PR body + post incident updates
+      id: link
+      shell: bash
+      env:
+        UW_API_TOKEN: ${{ inputs.api-token }}
+        UW_STATUS: ${{ inputs.status }}
+        UW_BASE_URL: ${{ inputs.base-url }}
+        UW_PR_BODY: ${{ github.event.pull_request.body }}
+        UW_PR_NUMBER: ${{ github.event.pull_request.number }}
+        UW_PR_TITLE: ${{ github.event.pull_request.title }}
+        UW_PR_URL: ${{ github.event.pull_request.html_url }}
+        UW_PR_MERGED: ${{ github.event.pull_request.merged }}
+        UW_ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+        if [ -z "${UW_API_TOKEN}" ]; then
+          echo "::error::api-token is required"
+          exit 1
+        fi
+        # Fail-fast on misconfiguration: this action only does
+        # something useful on a merged PR. Run on closed-but-not-merged
+        # → no-op with notice.
+        if [ "${UW_PR_MERGED}" != "true" ]; then
+          echo "::notice::PR not merged (merged=${UW_PR_MERGED}); skipping"
+          {
+            echo "matched-incidents="
+            echo "linked-count=0"
+          } >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+
+        base="${UW_BASE_URL%/}"
+
+        # Grep for `(Fixes|Closes|Resolves) #incident-<26-char ULID>`,
+        # case-insensitive. The incident publicId is the same Crockford
+        # base32 alphabet UptimeWarden uses for public IDs.
+        # Multiple matches OK; we dedupe with sort -u.
+        matches=$(printf '%s' "${UW_PR_BODY:-}" \
+          | grep -oiE '(fixes|closes|resolves)[[:space:]]+#incident-[0-9A-HJKMNP-TV-Z]{26}' \
+          | sed -E 's/.*#incident-([0-9A-HJKMNP-TV-Z]{26}).*/\1/I' \
+          | tr '[:lower:]' '[:upper:]' \
+          | sort -u || true)
+
+        if [ -z "${matches}" ]; then
+          echo "::notice::No incident references in PR body (looked for 'Fixes/Closes/Resolves #incident-<publicId>')"
+          {
+            echo "matched-incidents="
+            echo "linked-count=0"
+          } >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+
+        echo "::notice::Matched incidents: $(echo "${matches}" | tr '\n' ',' | sed 's/,$//')"
+
+        linked=0
+        matched_csv=""
+        for publicId in ${matches}; do
+          if [ -z "${matched_csv}" ]; then
+            matched_csv="${publicId}"
+          else
+            matched_csv="${matched_csv},${publicId}"
+          fi
+
+          # Build update body. Status pass-through (defaults to
+          # "monitoring"); message references the PR for human
+          # readers + machine indexing.
+          message="Merged PR ${UW_PR_URL} (${UW_PR_TITLE}) by @${UW_ACTOR}"
+          # Escape double-quotes inside the message before stuffing
+          # it into a JSON literal — sed handles the simple cases;
+          # PR titles with embedded quotes are rare but real.
+          safe_message=$(printf '%s' "${message}" | sed 's/"/\\"/g')
+          body=$(printf '{"message":"%s"}' "${safe_message}")
+
+          tmp=$(mktemp)
+          http=$(curl --silent --show-error \
+            --max-time 30 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${UW_API_TOKEN}" \
+            -H "User-Agent: uptimewarden-postmortem-link-action/1.0" \
+            --data "${body}" \
+            --output "${tmp}" \
+            --write-out "%{http_code}" \
+            "${base}/api/v1/incidents/${publicId}/comments") || true
+
+          case "${http}" in
+            201|200)
+              linked=$((linked + 1))
+              echo "::notice::Linked incident ${publicId}"
+              ;;
+            404)
+              echo "::warning::Incident ${publicId} not found (token scope or typo); skipping"
+              ;;
+            403)
+              echo "::warning::No editor access to incident ${publicId}; skipping"
+              ;;
+            *)
+              echo "::warning::Failed to link ${publicId} (HTTP ${http}): $(cat "${tmp}")"
+              ;;
+          esac
+        done
+
+        {
+          echo "matched-incidents=${matched_csv}"
+          echo "linked-count=${linked}"
+        } >> "${GITHUB_OUTPUT}"
+
+        # Job summary
+        if [ "${linked}" -gt 0 ]; then
+          {
+            echo "## UptimeWarden Postmortem Links 📝"
+            echo ""
+            echo "Linked [PR #${UW_PR_NUMBER}](${UW_PR_URL}) to **${linked}** incident(s)"
+            echo ""
+            echo "Incidents: \`${matched_csv}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+        fi

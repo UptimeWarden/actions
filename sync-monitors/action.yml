@@ -1,0 +1,176 @@
+# UptimeWarden Sync Monitors: Monitoring-as-Code in CI.
+#
+# Installs @uptimewarden/cli and runs `uw apply` against your config file.
+# On pull requests it shows the plan (diff); on push to main it applies.
+# Needs only a standard UptimeWarden API token.
+
+name: 'UptimeWarden Sync Monitors'
+description: 'Apply a Monitoring-as-Code config to UptimeWarden from CI. Dry-run on PRs, apply on push.'
+author: 'UptimeWarden'
+
+branding:
+  icon: 'refresh-cw'
+  color: 'blue'
+
+inputs:
+  api-token:
+    description: 'UptimeWarden API token with Monitor Manager permissions.'
+    required: true
+  config-file:
+    description: 'Path to the Monitoring-as-Code config file (JSON: { monitors: [...] }).'
+    required: false
+    default: 'monitors.uw.json'
+  mode:
+    description: |
+      apply  — apply all changes (--yes). Use on push to main.
+      diff   — show plan only, exit 2 if drift detected. Use on pull_request.
+      plan   — show plan only, always exit 0. Use for informational runs.
+    required: false
+    default: 'apply'
+  allow-delete:
+    description: 'Allow deletion of monitors not in the config. Default false (deletes are shown but not applied).'
+    required: false
+    default: 'false'
+  node-version:
+    description: 'Node.js version used to run the CLI (20 or later).'
+    required: false
+    default: '22'
+  base-url:
+    description: 'API base URL. Default: https://app.uptimewarden.online'
+    required: false
+    default: 'https://app.uptimewarden.online'
+
+outputs:
+  created:
+    description: 'Number of monitors created (0 in plan/diff mode).'
+    value: ${{ steps.apply.outputs.created }}
+  updated:
+    description: 'Number of monitors updated (0 in plan/diff mode).'
+    value: ${{ steps.apply.outputs.updated }}
+  deleted:
+    description: 'Number of monitors deleted (0 unless --allow-delete + apply mode).'
+    value: ${{ steps.apply.outputs.deleted }}
+  has-drift:
+    description: 'true if the config differs from live state.'
+    value: ${{ steps.apply.outputs.has-drift }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install UptimeWarden CLI
+      shell: bash
+      run: npm install -g @uptimewarden/cli
+
+    - name: Apply / Diff monitors
+      id: apply
+      shell: bash
+      env:
+        UW_API_TOKEN: ${{ inputs.api-token }}
+        UW_BASE_URL: ${{ inputs.base-url }}
+        UW_MODE: ${{ inputs.mode }}
+        UW_ALLOW_DELETE: ${{ inputs.allow-delete }}
+        UW_CONFIG_FILE: ${{ inputs.config-file }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${UW_API_TOKEN}" ]; then
+          echo "::error::api-token is required"
+          exit 1
+        fi
+
+        case "${UW_MODE}" in
+          apply|diff|plan) : ;;
+          *)
+            echo "::error::mode must be one of: apply, diff, plan (got '${UW_MODE}')"
+            exit 1
+            ;;
+        esac
+
+        if [ ! -f "${UW_CONFIG_FILE}" ]; then
+          echo "::error::Config file not found: ${UW_CONFIG_FILE}"
+          exit 1
+        fi
+
+        uw auth login --token "${UW_API_TOKEN}" --base-url "${UW_BASE_URL}"
+
+        APPLY_ARGS="-f ${UW_CONFIG_FILE} --base-url ${UW_BASE_URL}"
+
+        if [ "${UW_MODE}" = "apply" ]; then
+          APPLY_ARGS="${APPLY_ARGS} --yes"
+        fi
+        if [ "${UW_MODE}" = "diff" ]; then
+          APPLY_ARGS="${APPLY_ARGS} --diff-only"
+        fi
+        if [ "${UW_ALLOW_DELETE}" = "true" ]; then
+          APPLY_ARGS="${APPLY_ARGS} --allow-delete"
+        fi
+
+        # Run apply and capture output for step summary + outputs.
+        set +e
+        output=$(uw apply ${APPLY_ARGS} 2>&1)
+        exit_code=$?
+        set -e
+
+        echo "${output}"
+
+        # Parse counters from output (simple grep; CLI writes human-readable lines).
+        created=$(printf '%s' "${output}" | grep -c '✓ created' || true)
+        updated=$(printf '%s' "${output}" | grep -c '✓ updated' || true)
+        deleted=$(printf '%s' "${output}" | grep -c '✓ deleted' || true)
+
+        # Detect drift: any + / ~ / - lines in the plan means drift.
+        has_drift="false"
+        if printf '%s' "${output}" | grep -qE '^\s+[+~-] '; then
+          has_drift="true"
+        fi
+
+        {
+          echo "created=${created}"
+          echo "updated=${updated}"
+          echo "deleted=${deleted}"
+          echo "has-drift=${has_drift}"
+        } >> "${GITHUB_OUTPUT}"
+
+        # Job summary
+        {
+          case "${UW_MODE}" in
+            apply)
+              if [ "$((created + updated + deleted))" -gt 0 ]; then
+                echo "## UptimeWarden Monitor Sync ✅"
+                echo ""
+                echo "| Created | Updated | Deleted |"
+                echo "|---------|---------|---------|"
+                echo "| ${created} | ${updated} | ${deleted} |"
+              else
+                echo "## UptimeWarden Monitor Sync ✅"
+                echo ""
+                echo "No changes — monitors are in sync."
+              fi
+              ;;
+            diff)
+              if [ "${has_drift}" = "true" ]; then
+                echo "## UptimeWarden Monitor Sync 🔴 Drift detected"
+                echo ""
+                echo "\`\`\`"
+                printf '%s\n' "${output}"
+                echo "\`\`\`"
+              else
+                echo "## UptimeWarden Monitor Sync ✅ No drift"
+              fi
+              ;;
+            plan)
+              echo "## UptimeWarden Monitor Sync — Plan"
+              echo ""
+              echo "\`\`\`"
+              printf '%s\n' "${output}"
+              echo "\`\`\`"
+              ;;
+          esac
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        exit "${exit_code}"

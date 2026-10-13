@@ -1,0 +1,263 @@
+# UptimeWarden Check: a one-shot, multi-region uptime probe.
+#
+# Drop it into any GitHub workflow and get an "up / down" answer from
+# UptimeWarden's regional probes. No UptimeWarden account is required:
+# without an API token the action authenticates with the workflow's
+# GitHub OIDC token, so the calling job needs `permissions: id-token: write`.
+
+name: 'UptimeWarden Check'
+description: 'One-shot multi-region uptime check from any GitHub workflow. No UptimeWarden account required (GitHub OIDC).'
+author: 'UptimeWarden'
+
+branding:
+  icon: 'globe'
+  color: 'blue'
+
+inputs:
+  url:
+    description: 'Target URL to probe (http or https, public IPs only).'
+    required: true
+  regions:
+    description: 'Comma-separated regions to probe from (ae, brs, gwc, sea, uaen, wus3). Default: gwc. Without an account (GitHub OIDC) one region per check; with a UW API token up to your plan''s verification region limit.'
+    required: false
+    default: ''
+  expect-status:
+    description: 'HTTP status code expected from the target. If omitted, any 2xx is treated as up.'
+    required: false
+    default: ''
+  timeout:
+    description: 'Per-region probe timeout (e.g. 10s, 5000ms, 30s). Server enforces a 50s ceiling, so the whole request stays under the gateway timeout.'
+    required: false
+    default: '30s'
+  fail-on-down:
+    description: 'If true (default), step exits non-zero when any region reports down. Set to false to record results without failing the job.'
+    required: false
+    default: 'true'
+  api-token:
+    description: 'Optional UW API token. Your plan''s limits apply: its daily check budget, shared by all your tokens, and its verification region limit as regions per check. An invalid or expired token fails with 401. Without a token, GitHub OIDC allows 5 checks a day and 1 region.'
+    required: false
+    default: ''
+  audience:
+    description: 'OIDC audience to request from GitHub. Must match the UW server-side default.'
+    required: false
+    default: 'uptimewarden'
+  base-url:
+    description: 'API base URL. Default: https://app.uptimewarden.online'
+    required: false
+    default: 'https://app.uptimewarden.online'
+
+outputs:
+  up:
+    description: 'true if every probed region reported up; false otherwise.'
+    value: ${{ steps.probe.outputs.up }}
+  regions-down:
+    description: 'Comma-separated list of regions that reported down. Empty if all up.'
+    value: ${{ steps.probe.outputs.regions-down }}
+  slowest-region-ms:
+    description: 'Highest responseTimeMs across all regions. Useful for build-time SLA assertions.'
+    value: ${{ steps.probe.outputs.slowest-region-ms }}
+  result-json:
+    description: 'Raw JSON response from /api/public/check (the `checks` array).'
+    value: ${{ steps.probe.outputs.result-json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Probe + project outputs
+      id: probe
+      shell: bash
+      env:
+        UW_URL: ${{ inputs.url }}
+        UW_REGIONS: ${{ inputs.regions }}
+        UW_EXPECT_STATUS: ${{ inputs.expect-status }}
+        UW_TIMEOUT: ${{ inputs.timeout }}
+        UW_FAIL_ON_DOWN: ${{ inputs.fail-on-down }}
+        UW_API_TOKEN: ${{ inputs.api-token }}
+        UW_AUDIENCE: ${{ inputs.audience }}
+        UW_BASE_URL: ${{ inputs.base-url }}
+      run: |
+        set -euo pipefail
+        if [ -z "${UW_URL}" ]; then
+          echo "::error::url is required"
+          exit 1
+        fi
+
+        base="${UW_BASE_URL%/}"
+
+        # Parse `timeout` (10s / 5000ms / 30s) → milliseconds.
+        # Server accepts [1s, 50s] so anything outside that gets
+        # rejected; we still parse client-side to fail fast.
+        parse_ms() {
+          local raw="$1"
+          local n unit
+          n=$(printf '%s' "$raw" | sed -E 's/[^0-9]//g')
+          unit=$(printf '%s' "$raw" | sed -E 's/[0-9]//g' | tr '[:upper:]' '[:lower:]')
+          if [ -z "${n}" ]; then
+            echo "::error::Invalid timeout: ${raw}"
+            exit 1
+          fi
+          case "${unit}" in
+            ""|"ms") echo "${n}" ;;
+            "s"|"sec") echo "$((n * 1000))" ;;
+            "m"|"min") echo "$((n * 60 * 1000))" ;;
+            *)
+              echo "::error::Unknown timeout unit: ${unit}"
+              exit 1
+              ;;
+          esac
+        }
+        timeout_ms=$(parse_ms "${UW_TIMEOUT}")
+
+        # Build request body. We avoid jq for the request side so the
+        # action runs on minimal runners; printf is enough for our
+        # narrow JSON shape.
+        regions_json="[]"
+        if [ -n "${UW_REGIONS}" ]; then
+          regions_json=$(printf '%s' "${UW_REGIONS}" | tr ',' '\n' | awk 'NF{printf "%s\"%s\"", sep, $0; sep=","}')
+          regions_json="[${regions_json}]"
+        fi
+        body_parts=$(printf '"url":"%s","regions":%s,"timeoutMs":%d' \
+          "${UW_URL}" "${regions_json}" "${timeout_ms}")
+        if [ -n "${UW_EXPECT_STATUS}" ]; then
+          body_parts="${body_parts}$(printf ',"expectStatus":%d' "${UW_EXPECT_STATUS}")"
+        fi
+        body="{${body_parts}}"
+
+        # Authentication: prefer UW API token if provided; otherwise
+        # exchange the workflow's id-token for a JWT bound to our audience.
+        if [ -n "${UW_API_TOKEN}" ]; then
+          auth_header="Authorization: Bearer ${UW_API_TOKEN}"
+          echo "::notice::Using UW API token for authentication"
+        else
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::OIDC token request env vars missing — add 'permissions: id-token: write' to the calling job, or supply api-token explicitly"
+            exit 1
+          fi
+          # GitHub OIDC token endpoint. The response shape is
+          # {"value":"eyJ...","count":1}; jq is pre-installed on
+          # GH-hosted runners (ubuntu / macOS / windows-bash).
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is required for OIDC token retrieval — install it on self-hosted runners"
+            exit 1
+          fi
+          oidc_resp=$(curl --fail --show-error --silent \
+            --max-time 10 \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            -H "Accept: application/json; api-version=2.0" \
+            -H "Content-Type: application/json" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${UW_AUDIENCE}")
+          id_token=$(printf '%s' "${oidc_resp}" | jq -r '.value')
+          if [ -z "${id_token}" ] || [ "${id_token}" = "null" ]; then
+            echo "::error::Failed to retrieve OIDC token from GitHub"
+            exit 1
+          fi
+          auth_header="Authorization: Bearer ${id_token}"
+        fi
+
+        # POST the probe. We capture HTTP status separately so we can
+        # branch on rate-limit (429) vs validation (400) vs success.
+        tmp_body=$(mktemp)
+        http_status=$(curl --silent --show-error \
+          --max-time 90 \
+          -X POST \
+          -H "Content-Type: application/json" \
+          -H "${auth_header}" \
+          -H "User-Agent: uptimewarden-check-action/1.0" \
+          --data "${body}" \
+          --output "${tmp_body}" \
+          --write-out "%{http_code}" \
+          "${base}/api/public/check") || true
+
+        case "${http_status}" in
+          200)
+            : # fall through to projection
+            ;;
+          400)
+            echo "::error::Invalid request: $(cat "${tmp_body}")"
+            exit 1
+            ;;
+          401|403)
+            echo "::error::Auth failed (HTTP ${http_status}): $(cat "${tmp_body}")"
+            exit 1
+            ;;
+          404)
+            echo "::error::Unknown region: $(cat "${tmp_body}")"
+            exit 1
+            ;;
+          409)
+            echo "::error::Too many regions for this tier: $(cat "${tmp_body}")"
+            exit 1
+            ;;
+          429)
+            echo "::error::Rate limited — $(cat "${tmp_body}")"
+            exit 1
+            ;;
+          503)
+            echo "::error::Service unavailable: $(cat "${tmp_body}")"
+            exit 1
+            ;;
+          *)
+            echo "::error::Unexpected HTTP ${http_status}: $(cat "${tmp_body}")"
+            exit 1
+            ;;
+        esac
+
+        result=$(cat "${tmp_body}")
+        # Project per-region results. Use jq for robustness — already
+        # asserted available above for OIDC, and required regardless
+        # for parsing the response (with jq we get correct CSV / max).
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq is required to parse the response"
+          exit 1
+        fi
+        regions_down=$(printf '%s' "${result}" | jq -r '[.checks[] | select(.status != "up") | .region] | join(",")')
+        slowest=$(printf '%s' "${result}" | jq -r '[.checks[].responseTimeMs // 0] | max // 0')
+        all_up=$(printf '%s' "${result}" | jq -r 'if [.checks[].status] | all(. == "up") then "true" else "false" end')
+
+        # Single-line outputs only — `result-json` may have newlines
+        # we'd rather not propagate; collapse with @json to a single
+        # JSON-encoded string.
+        compact=$(printf '%s' "${result}" | jq -c '.checks')
+
+        {
+          echo "up=${all_up}"
+          echo "regions-down=${regions_down}"
+          echo "slowest-region-ms=${slowest}"
+        } >> "${GITHUB_OUTPUT}"
+        # result-json may contain control chars — use heredoc form.
+        {
+          echo "result-json<<__UW_EOF__"
+          printf '%s\n' "${compact}"
+          echo "__UW_EOF__"
+        } >> "${GITHUB_OUTPUT}"
+
+        # Write rich job summary — visible in the Actions run UI.
+        {
+          if [ "${all_up}" = "true" ]; then
+            echo "## UptimeWarden Check 🟢"
+          else
+            echo "## UptimeWarden Check 🔴"
+          fi
+          echo ""
+          echo "**Target:** \`${UW_URL}\`"
+          echo ""
+          echo "| Region | Status | Response Time |"
+          echo "|--------|--------|---------------|"
+          printf '%s' "${result}" | jq -r \
+            '.checks[] | "| \(.region) | \(if .status == "up" then "🟢 Up" else "🔴 Down" end) | \(if .responseTimeMs then "\(.responseTimeMs)ms" else "—" end) |"'
+          echo ""
+          if [ "${all_up}" = "true" ]; then
+            echo "> ✅ All regions up · slowest **${slowest}ms**"
+          else
+            echo "> ❌ Regions down: \`${regions_down}\` · slowest **${slowest}ms**"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        if [ "${all_up}" = "true" ]; then
+          echo "::notice::All regions reported up (slowest ${slowest}ms)"
+        else
+          echo "::warning::Regions down: ${regions_down}"
+          if [ "${UW_FAIL_ON_DOWN}" = "true" ]; then
+            exit 1
+          fi
+        fi

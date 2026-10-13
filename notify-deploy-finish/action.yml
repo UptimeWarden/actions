@@ -1,0 +1,115 @@
+# UptimeWarden Notify Deploy: finish phase.
+#
+# Closes the maintenance windows opened by `notify-deploy-start` and
+# patches the deploy marker with the final job status.
+#
+# Run this with `if: always()` so it fires whether the deploy succeeded,
+# failed, or was cancelled. The mute ceiling on each window is a safety
+# net if this step is skipped (for example a runner crash): the windows
+# expire server-side after the ceiling.
+
+name: 'UptimeWarden Notify Deploy (finish)'
+description: 'Close maintenance windows opened by notify-deploy-start and finalise the deploy marker.'
+author: 'UptimeWarden'
+
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  api-token:
+    description: 'UptimeWarden API token (uptw_…). Use the same token as notify-deploy-start.'
+    required: true
+  deploy-id:
+    description: 'deploy-id output from notify-deploy-start.'
+    required: true
+  monitor-windows:
+    description: 'monitor-windows output from notify-deploy-start (csv of monitorId:windowId).'
+    required: false
+    default: ''
+  status:
+    description: 'Final status. Pass ${{ job.status }} so cancel/failure are reflected. One of: success | failure | cancelled.'
+    required: false
+    default: 'success'
+  base-url:
+    description: 'API base URL. Default: https://app.uptimewarden.online'
+    required: false
+    default: 'https://app.uptimewarden.online'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Close maintenance windows + finalise deploy
+      shell: bash
+      env:
+        UW_API_TOKEN: ${{ inputs.api-token }}
+        UW_DEPLOY_ID: ${{ inputs.deploy-id }}
+        UW_MONITOR_WINDOWS: ${{ inputs.monitor-windows }}
+        UW_STATUS: ${{ inputs.status }}
+        UW_BASE_URL: ${{ inputs.base-url }}
+      run: |
+        # Post-step semantics: NEVER fail the workflow from cleanup.
+        # Each curl absorbs its own error and emits a ::warning::.
+        set +e
+        base="${UW_BASE_URL%/}"
+
+        if [ -z "${UW_API_TOKEN}" ]; then
+          echo "::warning::api-token missing; skipping notify-deploy-finish"
+          exit 0
+        fi
+
+        # Map job.status (success | failure | cancelled) → deploy status.
+        case "${UW_STATUS}" in
+          success|failure|cancelled) status="${UW_STATUS}" ;;
+          *) status="success" ;;  # unknown → conservative default
+        esac
+
+        # 1) Close every maintenance window.
+        if [ -n "${UW_MONITOR_WINDOWS}" ]; then
+          for pair in $(printf '%s' "${UW_MONITOR_WINDOWS}" | tr ',' ' '); do
+            monitor="${pair%%:*}"
+            window_id="${pair##*:}"
+            [ -z "${monitor}" ] && continue
+            [ -z "${window_id}" ] && continue
+            curl --silent --show-error --max-time 30 \
+              -X DELETE \
+              -H "Authorization: Bearer ${UW_API_TOKEN}" \
+              -H "User-Agent: uptimewarden-notify-deploy-finish/1.0" \
+              -o /dev/null \
+              "${base}/api/v1/monitors/${monitor}/maintenance/${window_id}" \
+              || echo "::warning::Failed to close maintenance window ${window_id} on ${monitor}"
+            echo "::notice::Closed maintenance window ${window_id} on ${monitor}"
+          done
+        fi
+
+        # 2) Patch the deploy marker with the final status.
+        if [ -n "${UW_DEPLOY_ID}" ]; then
+          status_payload=$(printf '{"status":"%s"}' "${status}")
+          curl --silent --show-error --max-time 30 \
+            -X PATCH \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${UW_API_TOKEN}" \
+            -H "User-Agent: uptimewarden-notify-deploy-finish/1.0" \
+            -o /dev/null \
+            --data "${status_payload}" \
+            "${base}/api/v1/deploys/${UW_DEPLOY_ID}" \
+            || echo "::warning::Failed to finalise deploy ${UW_DEPLOY_ID}"
+          echo "::notice::Deploy ${UW_DEPLOY_ID} finalised with status=${status}"
+        fi
+
+        # Job summary
+        {
+          case "${status}" in
+            success)  echo "## UptimeWarden Deploy Complete ✅" ;;
+            failure)  echo "## UptimeWarden Deploy Failed ❌" ;;
+            cancelled) echo "## UptimeWarden Deploy Cancelled ⚠️" ;;
+            *)         echo "## UptimeWarden Deploy Finished (${status})" ;;
+          esac
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Status | \`${status}\` |"
+          if [ -n "${UW_DEPLOY_ID}" ]; then
+            echo "| Deploy ID | \`${UW_DEPLOY_ID}\` |"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"

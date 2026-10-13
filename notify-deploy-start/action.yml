@@ -1,0 +1,218 @@
+# UptimeWarden Notify Deploy: start phase.
+#
+# Records a deploy marker on the UptimeWarden timeline and opens
+# (optional) maintenance windows on the listed monitors. Pair it with
+# `notify-deploy-finish` under `if: always()` so the windows close and
+# the marker is finalised whatever the build outcome.
+#
+# Composite actions don't support `runs.post` lifecycle hooks the way
+# JavaScript actions do, which is why this is a start/finish pair.
+
+name: 'UptimeWarden Notify Deploy (start)'
+description: 'Record a deploy marker on UptimeWarden + open maintenance windows for the duration of the deploy.'
+author: 'UptimeWarden'
+
+branding:
+  icon: 'play'
+  color: 'blue'
+
+inputs:
+  api-token:
+    description: 'UptimeWarden API token (uptw_…) with monitor write + deploy permissions.'
+    required: true
+  service:
+    description: 'Logical service name (e.g. "api", "checkout"). Free-form; surfaces on the timeline UI.'
+    required: true
+  version:
+    description: 'Version / tag / build identifier (e.g. "v1.2.3", git SHA).'
+    required: false
+    default: ''
+  commit-sha:
+    description: 'Commit SHA. Defaults to ${{ github.sha }} when omitted.'
+    required: false
+    default: ''
+  environment:
+    description: 'Deploy environment (e.g. production, staging).'
+    required: false
+    default: 'production'
+  monitors:
+    description: 'Comma-separated list of monitor publicIds (mon_*). Each will be muted for the deploy.'
+    required: false
+    default: ''
+  mute-ceiling:
+    description: 'Hard cap on mute duration (e.g. 30m, 2h, 240m). Server enforces a 4h max. Default 30m.'
+    required: false
+    default: '30m'
+  mute-reason:
+    description: 'Free-text reason recorded on each maintenance window (visible in audit log + UI badge).'
+    required: false
+    default: ''
+  base-url:
+    description: 'API base URL. Default: https://app.uptimewarden.online'
+    required: false
+    default: 'https://app.uptimewarden.online'
+
+outputs:
+  deploy-id:
+    description: 'publicId of the deploy marker. Pass this to notify-deploy-finish.'
+    value: ${{ steps.open.outputs.deploy-id }}
+  monitor-windows:
+    description: 'Comma-separated `monitorId:windowId` pairs. Pass this to notify-deploy-finish so it can close them.'
+    value: ${{ steps.open.outputs.monitor-windows }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Open deploy marker + maintenance windows
+      id: open
+      shell: bash
+      env:
+        UW_API_TOKEN: ${{ inputs.api-token }}
+        UW_SERVICE: ${{ inputs.service }}
+        UW_VERSION: ${{ inputs.version }}
+        UW_COMMIT_SHA: ${{ inputs.commit-sha != '' && inputs.commit-sha || github.sha }}
+        UW_ENVIRONMENT: ${{ inputs.environment }}
+        UW_MONITORS: ${{ inputs.monitors }}
+        UW_MUTE_CEILING: ${{ inputs.mute-ceiling }}
+        UW_MUTE_REASON: ${{ inputs.mute-reason != '' && inputs.mute-reason || format('Deploy {0} via GitHub Actions', github.sha) }}
+        UW_BASE_URL: ${{ inputs.base-url }}
+        UW_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        UW_GITHUB_ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+        if [ -z "${UW_API_TOKEN}" ]; then
+          echo "::error::api-token is required"
+          exit 1
+        fi
+        if [ -z "${UW_SERVICE}" ]; then
+          echo "::error::service is required"
+          exit 1
+        fi
+
+        base="${UW_BASE_URL%/}"
+
+        # Parse mute-ceiling (e.g. 30m, 2h, 240m, 90s) → minutes integer.
+        # Server cap is 4h (240m); we don't enforce here, server will 400.
+        parse_minutes() {
+          local raw="$1"
+          local n unit
+          n=$(printf '%s' "$raw" | sed -E 's/[^0-9]//g')
+          unit=$(printf '%s' "$raw" | sed -E 's/[0-9]//g' | tr '[:upper:]' '[:lower:]')
+          if [ -z "${n}" ]; then
+            echo "::error::Invalid mute-ceiling: ${raw}"
+            exit 1
+          fi
+          case "${unit}" in
+            ""|"m"|"min") echo "${n}" ;;
+            "h"|"hr") echo "$((n * 60))" ;;
+            "s"|"sec") echo "$(( (n + 59) / 60 ))" ;;  # round seconds up
+            *)
+              echo "::error::Unknown mute-ceiling unit: ${unit}"
+              exit 1
+              ;;
+          esac
+        }
+        duration_minutes=$(parse_minutes "${UW_MUTE_CEILING}")
+
+        # Build monitorPublicIds JSON array (csv → JSON array).
+        if [ -n "${UW_MONITORS}" ]; then
+          monitors_json=$(printf '%s' "${UW_MONITORS}" | tr ',' '\n' | awk 'NF{printf "%s\"%s\"", sep, $0; sep=","}')
+          monitors_json="[${monitors_json}]"
+        else
+          monitors_json="[]"
+        fi
+
+        # 1) POST /api/v1/deploys — record the marker.
+        deploy_body=$(printf '{"service":"%s","version":"%s","commitSha":"%s","environment":"%s","monitorPublicIds":%s,"source":"github-actions","metadata":{"workflowRunUrl":"%s","actor":"%s"}}' \
+          "${UW_SERVICE}" \
+          "${UW_VERSION}" \
+          "${UW_COMMIT_SHA}" \
+          "${UW_ENVIRONMENT}" \
+          "${monitors_json}" \
+          "${UW_WORKFLOW_RUN_URL}" \
+          "${UW_GITHUB_ACTOR}")
+
+        deploy_resp=$(curl --fail --show-error \
+          --silent \
+          --max-time 30 \
+          -X POST \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer ${UW_API_TOKEN}" \
+          -H "X-UW-Source: github-actions" \
+          -H "User-Agent: uptimewarden-notify-deploy-start/1.0" \
+          --data "${deploy_body}" \
+          "${base}/api/v1/deploys")
+
+        # Parse deployId — prefer jq (robust) with regex fallback for
+        # runners that don't have it (rare; jq ships on all GH-hosted runners).
+        if command -v jq >/dev/null 2>&1; then
+          deploy_id=$(printf '%s' "${deploy_resp}" | jq -r '.deployId // .data.deployId // empty')
+        else
+          deploy_id=$(printf '%s' "${deploy_resp}" | grep -oE '"deployId"[[:space:]]*:[[:space:]]*"[0-9A-HJKMNP-TV-Z]{26}"' | head -1 | sed -E 's/.*"([0-9A-HJKMNP-TV-Z]{26})".*/\1/')
+        fi
+        if [ -z "${deploy_id}" ]; then
+          echo "::error::Failed to parse deployId from /api/v1/deploys response"
+          echo "${deploy_resp}"
+          exit 1
+        fi
+        echo "deploy-id=${deploy_id}" >> "${GITHUB_OUTPUT}"
+        echo "::notice::UptimeWarden deploy marker recorded (deployId=${deploy_id})"
+
+        # 2) Open maintenance windows on each monitor.
+        monitor_windows=""
+        if [ -n "${UW_MONITORS}" ]; then
+          for monitor in $(printf '%s' "${UW_MONITORS}" | tr ',' ' '); do
+            [ -z "${monitor}" ] && continue
+            mute_body=$(printf '{"durationMinutes":%d,"reason":"%s","source":"github-actions"}' \
+              "${duration_minutes}" \
+              "${UW_MUTE_REASON//\"/\\\"}")
+            mute_resp=$(curl --fail --show-error \
+              --silent \
+              --max-time 30 \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${UW_API_TOKEN}" \
+              -H "Idempotency-Key: deploy-${deploy_id}-monitor-${monitor}" \
+              -H "User-Agent: uptimewarden-notify-deploy-start/1.0" \
+              --data "${mute_body}" \
+              "${base}/api/v1/monitors/${monitor}/maintenance" || true)
+            if command -v jq >/dev/null 2>&1; then
+              window_id=$(printf '%s' "${mute_resp}" | jq -r '.windowId // empty')
+            else
+              window_id=$(printf '%s' "${mute_resp}" | grep -oE '"windowId"[[:space:]]*:[[:space:]]*"mwin_[0-9A-HJKMNP-TV-Z]{26}"' | head -1 | sed -E 's/.*"(mwin_[0-9A-HJKMNP-TV-Z]{26})".*/\1/')
+            fi
+            if [ -n "${window_id}" ]; then
+              if [ -z "${monitor_windows}" ]; then
+                monitor_windows="${monitor}:${window_id}"
+              else
+                monitor_windows="${monitor_windows},${monitor}:${window_id}"
+              fi
+              echo "::notice::Opened maintenance window ${window_id} on monitor ${monitor} (${duration_minutes}m ceiling)"
+            else
+              # Don't fail the deploy because muting failed — the marker
+              # is the load-bearing artifact; mute is a nice-to-have.
+              echo "::warning::Failed to open maintenance window on monitor ${monitor}"
+              printf '%s\n' "${mute_resp}"
+            fi
+          done
+        fi
+        echo "monitor-windows=${monitor_windows}" >> "${GITHUB_OUTPUT}"
+
+        # Job summary
+        mute_count=0
+        if [ -n "${UW_MONITORS}" ]; then
+          mute_count=$(printf '%s' "${UW_MONITORS}" | tr ',' '\n' | grep -c '.' || true)
+        fi
+        {
+          echo "## UptimeWarden Deploy Started 🚀"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Service | **${UW_SERVICE}** |"
+          echo "| Version | \`${UW_VERSION}\` |"
+          echo "| Environment | **${UW_ENVIRONMENT}** |"
+          echo "| Deploy ID | \`${deploy_id}\` |"
+          if [ "${mute_count}" -gt 0 ]; then
+            echo "| Monitors muted | ${mute_count} (ceiling: ${UW_MUTE_CEILING}) |"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"

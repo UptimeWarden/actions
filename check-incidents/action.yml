@@ -1,0 +1,191 @@
+# UptimeWarden Check Incidents: a pre-deploy gate.
+#
+# Fails the step when there is an active incident on a configured monitor
+# at or above the severity threshold. Pairs with notify-deploy-start and
+# notify-deploy-finish to form a "don't deploy into a fire" pattern:
+#
+#   - check-incidents (this action)            <- gate
+#   - notify-deploy-start                      <- timeline marker + mute
+#   - your build / deploy steps
+#   - notify-deploy-finish                     <- cleanup
+#
+# Uses GET /api/v1/incidents?status=active (API-token surface).
+# Filtering and severity comparison happen client-side here.
+
+name: 'UptimeWarden Check Incidents'
+description: 'Pre-deploy gate — exit non-zero if any active UptimeWarden incident matches the configured monitors and severity threshold.'
+author: 'UptimeWarden'
+
+branding:
+  icon: 'shield-off'
+  color: 'red'
+
+inputs:
+  api-token:
+    description: 'UptimeWarden API token with `incidents:read` permission.'
+    required: true
+  monitors:
+    description: 'Comma-separated monitor publicIds to check. If omitted, every active incident on monitors you own counts.'
+    required: false
+    default: ''
+  severity-threshold:
+    description: 'Minimum severity that blocks. One of: minor, major, critical. Default major (major + critical block; minor passes through).'
+    required: false
+    default: 'major'
+  bypass:
+    description: 'If true, log incidents but do NOT fail the step. Useful for dashboards / dry-run modes. Default false (= block).'
+    required: false
+    default: 'false'
+  base-url:
+    description: 'API base URL. Default: https://app.uptimewarden.online'
+    required: false
+    default: 'https://app.uptimewarden.online'
+
+outputs:
+  blocked:
+    description: 'true when one or more incidents matched the threshold (whether or not the step actually exited non-zero).'
+    value: ${{ steps.check.outputs.blocked }}
+  incident-count:
+    description: 'Number of active incidents that matched the threshold + monitor filter.'
+    value: ${{ steps.check.outputs.incident-count }}
+  incidents-json:
+    description: 'Compact JSON array of matching incidents (each with publicId, monitorPublicId, severity, title).'
+    value: ${{ steps.check.outputs.incidents-json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Fetch active incidents + apply filters
+      id: check
+      shell: bash
+      env:
+        UW_API_TOKEN: ${{ inputs.api-token }}
+        UW_MONITORS: ${{ inputs.monitors }}
+        UW_THRESHOLD: ${{ inputs.severity-threshold }}
+        UW_BYPASS: ${{ inputs.bypass }}
+        UW_BASE_URL: ${{ inputs.base-url }}
+      run: |
+        set -euo pipefail
+        if [ -z "${UW_API_TOKEN}" ]; then
+          echo "::error::api-token is required"
+          exit 1
+        fi
+        case "${UW_THRESHOLD}" in
+          minor|major|critical) : ;;
+          *)
+            echo "::error::severity-threshold must be one of: minor, major, critical (got '${UW_THRESHOLD}')"
+            exit 1
+            ;;
+        esac
+
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq is required (preinstalled on every GH-hosted runner; install on self-hosted)"
+          exit 1
+        fi
+
+        base="${UW_BASE_URL%/}"
+
+        # Severity ordering: minor=1, major=2, critical=3.
+        case "${UW_THRESHOLD}" in
+          minor)    threshold_rank=1 ;;
+          major)    threshold_rank=2 ;;
+          critical) threshold_rank=3 ;;
+        esac
+
+        # Build a jq array of monitor publicIds to filter on. Empty
+        # string → no filter (every active incident the caller can
+        # see counts).
+        monitor_filter='[]'
+        if [ -n "${UW_MONITORS}" ]; then
+          monitor_filter=$(printf '%s' "${UW_MONITORS}" | tr ',' '\n' | awk 'NF{printf "%s\"%s\"", sep, $0; sep=","}')
+          monitor_filter="[${monitor_filter}]"
+        fi
+
+        # Fetch active incidents. The endpoint already returns only
+        # incidents on monitors the calling user owns / shares.
+        tmp=$(mktemp)
+        http=$(curl --silent --show-error \
+          --max-time 30 \
+          -H "Authorization: Bearer ${UW_API_TOKEN}" \
+          -H "User-Agent: uptimewarden-check-incidents-action/1.0" \
+          --output "${tmp}" \
+          --write-out "%{http_code}" \
+          "${base}/api/v1/incidents?status=active") || true
+
+        if [ "${http}" != "200" ]; then
+          echo "::error::Fetching active incidents failed (HTTP ${http}): $(cat "${tmp}")"
+          exit 1
+        fi
+
+        # Severity comparison. Each incident's `severity` is one of
+        # minor / major / critical.
+        # We rank, then keep those >= threshold AND (if filter set)
+        # whose monitorPublicId is in the filter list.
+        matched=$(jq --argjson threshold "${threshold_rank}" --argjson filter "${monitor_filter}" '
+          def severity_rank: (
+            if . == "minor" then 1
+            elif . == "major" then 2
+            elif . == "critical" then 3
+            else 0
+            end
+          );
+          [ (.data // .)[]
+            | select((.severity | severity_rank) >= $threshold)
+            | select(($filter | length) == 0 or (.monitorPublicId as $m | $filter | index($m)))
+            | { publicId, monitorPublicId, severity, title, status }
+          ]
+        ' "${tmp}")
+
+        count=$(printf '%s' "${matched}" | jq 'length')
+        compact=$(printf '%s' "${matched}" | jq -c .)
+
+        if [ "${count}" -gt 0 ]; then
+          blocked="true"
+        else
+          blocked="false"
+        fi
+
+        {
+          echo "blocked=${blocked}"
+          echo "incident-count=${count}"
+        } >> "${GITHUB_OUTPUT}"
+        # Heredoc form for incidents-json so embedded characters can't
+        # corrupt the GITHUB_OUTPUT file format.
+        {
+          echo "incidents-json<<__UW_EOF__"
+          printf '%s\n' "${compact}"
+          echo "__UW_EOF__"
+        } >> "${GITHUB_OUTPUT}"
+
+        # Job summary
+        {
+          if [ "${blocked}" = "true" ]; then
+            echo "## UptimeWarden Incident Gate 🚨"
+            echo ""
+            echo "**Blocked: ${count} active incident(s)** at or above \`${UW_THRESHOLD}\` severity"
+            echo ""
+            echo "| Severity | Monitor | Title |"
+            echo "|----------|---------|-------|"
+            printf '%s' "${matched}" | jq -r \
+              '.[] | "| \(.severity) | `\(.monitorPublicId // "—")` | \(.title // "—") |"'
+            if [ "${UW_BYPASS}" = "true" ]; then
+              echo ""
+              echo "> ⚠️ \`bypass=true\` — step continued despite blocking incidents"
+            fi
+          else
+            echo "## UptimeWarden Incident Gate ✅"
+            echo ""
+            echo "No active incidents at or above \`${UW_THRESHOLD}\` severity — clear to deploy"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        if [ "${blocked}" = "true" ]; then
+          echo "::warning::${count} active incident(s) at or above '${UW_THRESHOLD}'"
+          printf '%s' "${matched}" | jq -r '.[] | "  - \(.severity) \(.publicId // "?") on \(.monitorPublicId // "?"): \(.title)"'
+          if [ "${UW_BYPASS}" != "true" ]; then
+            exit 1
+          fi
+          echo "::notice::bypass=true — continuing despite blocking incidents"
+        else
+          echo "::notice::No active incidents at or above '${UW_THRESHOLD}' — clear to deploy"
+        fi
